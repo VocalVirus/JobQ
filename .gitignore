@@ -13,3 +13,8 @@ desktop.ini
 # Logs / temp
 *.log
 tmp/
+
+# Build artifacts
+*.exe
+run.out
+run.err

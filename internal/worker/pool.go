@@ -7,6 +7,7 @@
 package worker
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -50,20 +51,23 @@ func NewPool(cfg Config) *Pool {
 
 // Start launches the worker goroutines. They immediately begin waiting for
 // jobs to arrive on the channel.
-func (p *Pool) Start() {
+//
+// The ctx lets us cancel long waits (like a retry backoff) promptly when the
+// program is shutting down, so we don't sit sleeping while the user waits.
+func (p *Pool) Start(ctx context.Context) {
 	for i := 1; i <= p.cfg.NumWorkers; i++ {
 		// wg.Add(1) records "one more goroutine is running." Shutdown uses this
 		// to wait until every worker has finished.
 		p.wg.Add(1)
 		// The `go` keyword starts a goroutine: p.worker(i) runs concurrently and
 		// the loop keeps going. This is how we get NumWorkers workers at once.
-		go p.worker(i)
+		go p.worker(ctx, i)
 	}
 	log.Printf("pool started with %d workers", p.cfg.NumWorkers)
 }
 
 // worker is the loop each goroutine runs: pull a job, process it, repeat.
-func (p *Pool) worker(id int) {
+func (p *Pool) worker(ctx context.Context, id int) {
 	// defer wg.Done() runs when this function returns, telling the WaitGroup
 	// "this worker has finished." Pairs with the wg.Add(1) in Start.
 	defer p.wg.Done()
@@ -72,7 +76,7 @@ func (p *Pool) worker(id int) {
 	// blocks when the channel is empty, and exits automatically once the
 	// channel is closed AND drained. That's how workers know to stop.
 	for j := range p.jobs {
-		p.process(id, j)
+		p.process(ctx, id, j)
 	}
 }
 
@@ -83,7 +87,7 @@ func (p *Pool) worker(id int) {
 // the backoff. That's fine for learning the retry concept. When we add Redis
 // (a later phase) we'll re-queue the job with a delay instead, so the worker
 // stays free. Worth remembering as a real trade-off.
-func (p *Pool) process(workerID int, j job.Job) {
+func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
 	for {
 		j.Attempts++
 
@@ -101,11 +105,24 @@ func (p *Pool) process(workerID int, j job.Job) {
 			return
 		}
 
-		// Otherwise wait (exponential backoff) and try again.
+		// Otherwise wait (exponential backoff) and try again — but make the wait
+		// interruptible. `select` blocks until one of its cases can proceed:
+		//   - time.After(wait) fires when the backoff elapses -> retry.
+		//   - ctx.Done() fires if we're shutting down -> abandon the retry now
+		//     instead of sleeping. (When Redis arrives, an abandoned job stays in
+		//     the queue and another instance picks it up; in memory it's just lost,
+		//     which is an honest limitation of this phase.)
 		wait := backoff(j.Attempts, p.cfg.BaseBackoff, p.cfg.MaxBackoff)
 		log.Printf("worker %d: job %d failed attempt %d (%v) -> retry in %s",
 			workerID, j.ID, j.Attempts, err, wait.Round(time.Millisecond))
-		time.Sleep(wait)
+
+		select {
+		case <-time.After(wait):
+			// backoff elapsed; loop around and retry
+		case <-ctx.Done():
+			log.Printf("worker %d: job %d retry abandoned due to shutdown", workerID, j.ID)
+			return
+		}
 	}
 }
 
