@@ -24,6 +24,12 @@ type Config struct {
 	BaseBackoff time.Duration // wait before the first retry (grows exponentially after)
 	MaxBackoff  time.Duration // cap on the retry wait
 	Handler     job.Handler   // what to actually do with each job
+
+	// OnStatus, if set, is called whenever a job changes state (queued -> running
+	// -> succeeded/failed/dead). It's how the pool reports progress to the outside
+	// world (e.g. a status store) without the pool needing to know what that store
+	// is. Optional: leave it nil and the pool simply won't report.
+	OnStatus func(id int, status job.Status, attempts int)
 }
 
 // Pool manages a group of worker goroutines that share one job queue.
@@ -90,10 +96,12 @@ func (p *Pool) worker(ctx context.Context, id int) {
 func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
 	for {
 		j.Attempts++
+		p.setStatus(j.ID, job.StatusRunning, j.Attempts)
 
 		err := p.cfg.Handler(j)
 		if err == nil {
 			log.Printf("worker %d: job %d SUCCEEDED on attempt %d", workerID, j.ID, j.Attempts)
+			p.setStatus(j.ID, job.StatusSucceeded, j.Attempts)
 			return
 		}
 
@@ -101,9 +109,13 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
 		if j.Attempts >= p.cfg.MaxAttempts {
 			log.Printf("worker %d: job %d FAILED permanently after %d attempts (%v) -> dead-letter",
 				workerID, j.ID, j.Attempts, err)
+			p.setStatus(j.ID, job.StatusDead, j.Attempts)
 			p.toDeadLetter(j)
 			return
 		}
+
+		// A transient failure: mark it failed (a retry is pending).
+		p.setStatus(j.ID, job.StatusFailed, j.Attempts)
 
 		// Otherwise wait (exponential backoff) and try again — but make the wait
 		// interruptible. `select` blocks until one of its cases can proceed:
@@ -123,6 +135,14 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
 			log.Printf("worker %d: job %d retry abandoned due to shutdown", workerID, j.ID)
 			return
 		}
+	}
+}
+
+// setStatus reports a job's state change to the OnStatus hook, if one is set.
+// Kept nil-safe so callers that don't care about status can ignore it entirely.
+func (p *Pool) setStatus(id int, s job.Status, attempts int) {
+	if p.cfg.OnStatus != nil {
+		p.cfg.OnStatus(id, s, attempts)
 	}
 }
 

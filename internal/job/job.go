@@ -15,6 +15,18 @@ type Job struct {
 	Attempts int    // how many times we've tried to process this job (starts at 0)
 }
 
+// Status describes where a job is in its lifecycle. Tracking this is what lets
+// a caller submit a job and later ask "is it done yet?".
+type Status string
+
+const (
+	StatusQueued    Status = "queued"    // accepted, waiting for a worker
+	StatusRunning   Status = "running"   // a worker is processing it right now
+	StatusSucceeded Status = "succeeded" // finished successfully
+	StatusFailed    Status = "failed"    // an attempt failed; a retry is pending
+	StatusDead      Status = "dead"      // failed too many times; moved to dead-letter
+)
+
 // Handler is a function that processes one Job.
 //
 // This is the "what do I actually DO with a job" plug-in point. The worker
