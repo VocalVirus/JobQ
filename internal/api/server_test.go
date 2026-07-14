@@ -15,7 +15,7 @@ import (
 func newTestServer() (http.Handler, *[]job.Job) {
 	st := store.NewMemory()
 	var submitted []job.Job
-	srv := NewServer(st, func(j job.Job) { submitted = append(submitted, j) })
+	srv := NewServer(st, func(j job.Job) error { submitted = append(submitted, j); return nil })
 	return srv, &submitted
 }
 

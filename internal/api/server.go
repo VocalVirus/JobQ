@@ -15,15 +15,15 @@ import (
 
 // Server holds the dependencies the HTTP handlers need.
 type Server struct {
-	store  *store.Memory // where job records live (for status lookups)
-	submit func(job.Job) // how to hand a job to the worker pool
+	store  *store.Memory       // where job records live (for status lookups)
+	submit func(job.Job) error // how to hand a job to the durable queue; may fail
 }
 
 // NewServer wires up the routes and returns an http.Handler ready to serve.
 //
 // It uses Go 1.22+ routing patterns ("METHOD /path/{wildcard}"), so the method
 // and path are matched for us — no manual `if r.Method == ...` checks.
-func NewServer(st *store.Memory, submit func(job.Job)) http.Handler {
+func NewServer(st *store.Memory, submit func(job.Job) error) http.Handler {
 	s := &Server{store: st, submit: submit}
 
 	mux := http.NewServeMux()
@@ -50,11 +50,14 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record the job (assigns an ID, marks it queued), then hand it to the pool.
-	// Note: submit blocks if the queue is full — that's backpressure reaching all
-	// the way out to the HTTP caller, which is intentional.
+	// Record the job (assigns an ID, marks it queued), then enqueue it durably.
+	// If the queue is unreachable (e.g. Redis down) we must NOT report success —
+	// tell the caller to retry with a 503 rather than silently dropping the job.
 	j := s.store.Add(req.Payload)
-	s.submit(j)
+	if err := s.submit(j); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not enqueue job, try again")
+		return
+	}
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"id":     j.ID,

@@ -8,22 +8,30 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
 
 	"github.com/VocalVirus/jobq/internal/job"
+	"github.com/VocalVirus/jobq/internal/queue"
 )
 
 // Config holds the tunable settings for a Pool. Using a struct (instead of a
 // long list of function arguments) keeps things readable as options grow.
 type Config struct {
 	NumWorkers  int           // how many jobs can run at the same time ("parallelism")
-	QueueSize   int           // how many jobs can wait in the buffer before Submit blocks
 	MaxAttempts int           // total tries per job before it goes to the dead-letter list
 	BaseBackoff time.Duration // wait before the first retry (grows exponentially after)
 	MaxBackoff  time.Duration // cap on the retry wait
 	Handler     job.Handler   // what to actually do with each job
+
+	// Queue is the durable source of jobs. Workers pull from it, and Ack a job
+	// only once it reaches a terminal state (succeeded or dead-lettered). Until
+	// this phase the queue was an in-memory channel; now it's Redis-backed, so a
+	// job that a worker is holding when the process dies is NOT lost — it stays
+	// unacked and Redis redelivers it. That's the whole point of "at-least-once".
+	Queue queue.Queue
 
 	// OnStatus, if set, is called whenever a job changes state (queued -> running
 	// -> succeeded/failed/dead). It's how the pool reports progress to the outside
@@ -32,11 +40,10 @@ type Config struct {
 	OnStatus func(id int, status job.Status, attempts int)
 }
 
-// Pool manages a group of worker goroutines that share one job queue.
+// Pool manages a group of worker goroutines that share one durable job queue.
 type Pool struct {
-	cfg  Config
-	jobs chan job.Job // the queue: a channel every worker reads from
-	wg   sync.WaitGroup
+	cfg Config
+	wg  sync.WaitGroup
 
 	// deadLetter holds jobs that failed too many times. In a later phase this
 	// becomes a Postgres table + Redis stream; for now it's an in-memory slice.
@@ -47,12 +54,7 @@ type Pool struct {
 
 // NewPool builds a Pool from a Config.
 func NewPool(cfg Config) *Pool {
-	return &Pool{
-		cfg: cfg,
-		// A "buffered channel": it can hold up to QueueSize jobs waiting to be
-		// picked up. Think of it as the conveyor belt between producers and workers.
-		jobs: make(chan job.Job, cfg.QueueSize),
-	}
+	return &Pool{cfg: cfg}
 }
 
 // Start launches the worker goroutines. They immediately begin waiting for
@@ -72,28 +74,66 @@ func (p *Pool) Start(ctx context.Context) {
 	log.Printf("pool started with %d workers", p.cfg.NumWorkers)
 }
 
-// worker is the loop each goroutine runs: pull a job, process it, repeat.
+// worker is the loop each goroutine runs: pull a job off the durable queue,
+// process it, acknowledge it, repeat — until the context is cancelled.
 func (p *Pool) worker(ctx context.Context, id int) {
 	// defer wg.Done() runs when this function returns, telling the WaitGroup
 	// "this worker has finished." Pairs with the wg.Add(1) in Start.
 	defer p.wg.Done()
 
-	// `for j := range p.jobs` reads jobs off the channel one at a time. It
-	// blocks when the channel is empty, and exits automatically once the
-	// channel is closed AND drained. That's how workers know to stop.
-	for j := range p.jobs {
-		p.process(ctx, id, j)
+	for {
+		// Once we're shutting down, stop pulling. Any jobs still in Redis stay
+		// there durably and get picked up on the next start — nothing is dropped.
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Dequeue blocks up to its internal timeout. ErrNoJob just means "nothing
+		// waiting right now" — loop and ask again. A real error during shutdown is
+		// the context being cancelled, which we catch and exit on.
+		msg, err := p.cfg.Queue.Dequeue(ctx)
+		if err != nil {
+			if errors.Is(err, queue.ErrNoJob) {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("worker %d: dequeue error: %v", id, err)
+			continue
+		}
+
+		// Ack only if the job reached a terminal state. If process was abandoned
+		// mid-retry by a shutdown, we deliberately leave it unacked so Redis
+		// redelivers it later — at-least-once, no silent loss.
+		if p.process(ctx, id, msg.Job) {
+			p.ack(id, msg)
+		}
+	}
+}
+
+// ack confirms a finished job so Redis stops tracking it as pending. It uses a
+// short detached context (not the worker's) so an ack still lands even when the
+// worker loop is shutting down — otherwise a job we just completed could be
+// needlessly redelivered and run twice.
+func (p *Pool) ack(id int, msg queue.Message) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.cfg.Queue.Ack(ctx, msg); err != nil {
+		log.Printf("worker %d: ack failed: %v", id, err)
 	}
 }
 
 // process runs a single job, retrying with exponential backoff on failure.
+// It returns true when the job reached a terminal state (succeeded or
+// dead-lettered) and should be acked, or false when it was abandoned by a
+// shutdown mid-retry and should be left for redelivery.
 //
 // NOTE (honest limitation): while a job is waiting to retry, this function
 // sleeps — which ties up the worker and blocks it from doing other jobs during
-// the backoff. That's fine for learning the retry concept. When we add Redis
-// (a later phase) we'll re-queue the job with a delay instead, so the worker
-// stays free. Worth remembering as a real trade-off.
-func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
+// the backoff. A later phase can re-queue the job with a delay instead, so the
+// worker stays free. Worth remembering as a real trade-off.
+func (p *Pool) process(ctx context.Context, workerID int, j job.Job) bool {
 	for {
 		j.Attempts++
 		p.setStatus(j.ID, job.StatusRunning, j.Attempts)
@@ -102,7 +142,7 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
 		if err == nil {
 			log.Printf("worker %d: job %d SUCCEEDED on attempt %d", workerID, j.ID, j.Attempts)
 			p.setStatus(j.ID, job.StatusSucceeded, j.Attempts)
-			return
+			return true
 		}
 
 		// It failed. Have we exhausted our attempts?
@@ -111,7 +151,7 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
 				workerID, j.ID, j.Attempts, err)
 			p.setStatus(j.ID, job.StatusDead, j.Attempts)
 			p.toDeadLetter(j)
-			return
+			return true
 		}
 
 		// A transient failure: mark it failed (a retry is pending).
@@ -132,8 +172,8 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) {
 		case <-time.After(wait):
 			// backoff elapsed; loop around and retry
 		case <-ctx.Done():
-			log.Printf("worker %d: job %d retry abandoned due to shutdown", workerID, j.ID)
-			return
+			log.Printf("worker %d: job %d retry abandoned due to shutdown (stays queued in Redis)", workerID, j.ID)
+			return false
 		}
 	}
 }
@@ -164,23 +204,16 @@ func (p *Pool) DeadLetter() []job.Job {
 	return out
 }
 
-// Submit puts a job onto the queue to be processed.
+// Shutdown waits for all workers to stop and finish their in-flight jobs.
 //
-// If the queue buffer is full, this call blocks until a worker frees up space.
-// That blocking IS backpressure — the system refuses to accept infinite work.
-func (p *Pool) Submit(j job.Job) {
-	p.jobs <- j
-}
-
-// Shutdown stops accepting new jobs and waits for all in-flight jobs to finish.
+// Unlike the old in-memory channel, there's nothing to "drain" here: jobs the
+// workers haven't pulled yet live durably in Redis and survive the restart.
+// Workers notice the cancelled context (passed to Start), finish the job they're
+// holding, and exit — so this just blocks until every worker has done so.
 //
-// This is a "graceful shutdown": we don't drop jobs that are already queued.
-//  1. close(p.jobs) signals "no more jobs are coming."
-//  2. Each worker finishes draining the channel, then its range loop exits.
-//  3. wg.Wait() blocks here until every worker has called wg.Done().
+//	wg.Wait() blocks until every worker has called wg.Done().
 func (p *Pool) Shutdown() {
-	log.Println("shutting down: no longer accepting new jobs, draining queue...")
-	close(p.jobs)
+	log.Println("shutting down: workers finishing in-flight jobs, rest stay queued in Redis...")
 	p.wg.Wait()
 	log.Println("all workers finished")
 }

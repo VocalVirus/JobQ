@@ -1,10 +1,12 @@
 // Command jobq is the entry point for the JobQ service.
 //
-// Phase 3: JobQ is now an HTTP service. Jobs arrive from outside via a REST API
-// (POST /jobs), the worker pool processes them with retries, and callers can
-// poll GET /jobs/{id} for status. Shuts down gracefully on Ctrl+C: it stops
-// accepting HTTP requests, then drains in-flight jobs. Still in-memory (no
-// Redis/Postgres yet), so state is lost on restart — that's the next phase.
+// Phase 4: jobs now flow through a durable Redis queue. The HTTP API (POST /jobs)
+// enqueues them; the worker pool dequeues, processes with retries, and acks each
+// once done. Because a job stays unacked until it finishes, anything a worker was
+// holding when the process dies is redelivered on restart — no silent loss. Start
+// Redis first with `docker compose up -d`. Shuts down gracefully on Ctrl+C:
+// stops accepting HTTP requests, then lets in-flight jobs finish (the rest stay
+// safely queued in Redis).
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 
 	"github.com/VocalVirus/jobq/internal/api"
 	"github.com/VocalVirus/jobq/internal/job"
+	"github.com/VocalVirus/jobq/internal/queue"
 	"github.com/VocalVirus/jobq/internal/store"
 	"github.com/VocalVirus/jobq/internal/worker"
 )
@@ -41,13 +44,24 @@ func main() {
 	// The store tracks each job's status; the pool reports transitions to it.
 	st := store.NewMemory()
 
+	// Connect to the durable queue. REDIS_ADDR overrides the default for Docker.
+	redisAddr := "localhost:6379"
+	if a := os.Getenv("REDIS_ADDR"); a != "" {
+		redisAddr = a
+	}
+	q, err := queue.NewRedisQueue(redisAddr, "jobq:jobs", "workers", "jobq-1")
+	if err != nil {
+		log.Fatalf("connect to Redis at %s: %v (is `docker compose up -d` running?)", redisAddr, err)
+	}
+	defer q.Close()
+
 	pool := worker.NewPool(worker.Config{
 		NumWorkers:  3,
-		QueueSize:   100,
 		MaxAttempts: 4,
 		BaseBackoff: 100 * time.Millisecond,
 		MaxBackoff:  2 * time.Second,
 		Handler:     handler,
+		Queue:       q,            // workers pull from (and ack to) Redis
 		OnStatus:    st.SetStatus, // wire pool status updates into the store
 	})
 	pool.Start(ctx)
@@ -57,9 +71,13 @@ func main() {
 	if p := os.Getenv("PORT"); p != "" {
 		addr = ":" + p
 	}
+	// The API enqueues jobs durably. We adapt Enqueue (which needs a context) to
+	// the plain func(job.Job) error the server expects, using the app context so
+	// an enqueue is cancelled if we're shutting down.
+	submit := func(j job.Job) error { return q.Enqueue(ctx, j) }
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: api.NewServer(st, pool.Submit),
+		Handler: api.NewServer(st, submit),
 	}
 
 	// Run the server in a goroutine so main can wait for the shutdown signal.
@@ -83,7 +101,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown error: %v", err)
 	}
-	//  2. Drain the worker pool (finish jobs already queued).
+	//  2. Let the worker pool finish in-flight jobs (unpulled jobs stay in Redis).
 	pool.Shutdown()
 
 	dead := pool.DeadLetter()
