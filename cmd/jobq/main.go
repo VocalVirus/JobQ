@@ -1,10 +1,12 @@
 // Command jobq is the entry point for the JobQ service.
 //
-// Phase 4: jobs now flow through a durable Redis queue. The HTTP API (POST /jobs)
-// enqueues them; the worker pool dequeues, processes with retries, and acks each
-// once done. Because a job stays unacked until it finishes, anything a worker was
-// holding when the process dies is redelivered on restart — no silent loss. Start
-// Redis first with `docker compose up -d`. Shuts down gracefully on Ctrl+C:
+// Phase 5: jobs flow through a durable Redis queue AND their state is persisted
+// in Postgres, so both the queue and the status survive a restart. The HTTP API
+// (POST /jobs) records the job in Postgres and enqueues it; the worker pool
+// dequeues, processes with retries, and acks each once done. Because a job stays
+// unacked until it finishes, anything a worker was holding when the process dies
+// is redelivered on restart — no silent loss. Start Redis and Postgres first with
+// `docker compose up -d`. Shuts down gracefully on Ctrl+C:
 // stops accepting HTTP requests, then lets in-flight jobs finish (the rest stay
 // safely queued in Redis).
 package main
@@ -41,8 +43,17 @@ func main() {
 		return nil
 	}
 
-	// The store tracks each job's status; the pool reports transitions to it.
-	st := store.NewMemory()
+	// The store tracks each job's status durably in Postgres, so a status lookup
+	// still works after a restart. DATABASE_URL overrides the default for Docker.
+	dsn := "postgres://jobq:jobq@localhost:5432/jobq?sslmode=disable"
+	if u := os.Getenv("DATABASE_URL"); u != "" {
+		dsn = u
+	}
+	st, err := store.NewPostgres(ctx, dsn)
+	if err != nil {
+		log.Fatalf("connect to Postgres: %v (is `docker compose up -d` running?)", err)
+	}
+	defer st.Close()
 
 	// Connect to the durable queue. REDIS_ADDR overrides the default for Docker.
 	redisAddr := "localhost:6379"
