@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VocalVirus/jobq/internal/job"
 	"github.com/VocalVirus/jobq/internal/store"
@@ -15,7 +16,10 @@ import (
 func newTestServer() (http.Handler, *[]job.Job) {
 	st := store.NewMemory()
 	var submitted []job.Job
-	srv := NewServer(st, func(j job.Job) error { submitted = append(submitted, j); return nil })
+	srv := NewServer(st, func(j job.Job, _ time.Duration) error {
+		submitted = append(submitted, j)
+		return nil
+	})
 	return srv, &submitted
 }
 

@@ -5,8 +5,10 @@
 // (POST /jobs) records the job in Postgres and enqueues it; the worker pool
 // dequeues, processes with retries, and acks each once done. Because a job stays
 // unacked until it finishes, anything a worker was holding when the process dies
-// is redelivered on restart — no silent loss. Start Redis and Postgres first with
-// `docker compose up -d`. Shuts down gracefully on Ctrl+C:
+// is redelivered on restart — no silent loss. Jobs can also be scheduled for the
+// future (POST /jobs with delay_seconds): they wait in a Redis sorted set and a
+// promoter loop moves them onto the stream once due. Start Redis and Postgres
+// first with `docker compose up -d`. Shuts down gracefully on Ctrl+C:
 // stops accepting HTTP requests, then lets in-flight jobs finish (the rest stay
 // safely queued in Redis).
 package main
@@ -77,15 +79,43 @@ func main() {
 	})
 	pool.Start(ctx)
 
+	// Scheduler loop: once a second, promote any now-due delayed jobs from the
+	// sorted set into the live stream, where the worker pool picks them up. This
+	// is what turns "run in 30s" (EnqueueAt) into an actual delayed execution.
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Detached context so an in-progress promote isn't cancelled the
+				// instant we start shutting down; the loop still exits on ctx.Done.
+				if n, err := q.PromoteDue(context.Background(), 100); err != nil {
+					log.Printf("scheduler: %v", err)
+				} else if n > 0 {
+					log.Printf("scheduler: promoted %d due job(s)", n)
+				}
+			}
+		}
+	}()
+
 	// HTTP server. Port is :8080 by default, overridable via the PORT env var.
 	addr := ":8080"
 	if p := os.Getenv("PORT"); p != "" {
 		addr = ":" + p
 	}
-	// The API enqueues jobs durably. We adapt Enqueue (which needs a context) to
-	// the plain func(job.Job) error the server expects, using the app context so
-	// an enqueue is cancelled if we're shutting down.
-	submit := func(j job.Job) error { return q.Enqueue(ctx, j) }
+	// The API enqueues jobs durably. A zero delay goes straight onto the live
+	// stream; a positive delay is scheduled via the sorted set (EnqueueAt) and
+	// promoted later by the loop above. We use the app context so an enqueue is
+	// cancelled if we're shutting down.
+	submit := func(j job.Job, delay time.Duration) error {
+		if delay > 0 {
+			return q.EnqueueAt(ctx, j, time.Now().Add(delay))
+		}
+		return q.Enqueue(ctx, j)
+	}
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: api.NewServer(st, submit),

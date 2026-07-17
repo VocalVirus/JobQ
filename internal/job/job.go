@@ -20,6 +20,7 @@ type Job struct {
 type Status string
 
 const (
+	StatusScheduled Status = "scheduled" // accepted, but held until a future run-at time
 	StatusQueued    Status = "queued"    // accepted, waiting for a worker
 	StatusRunning   Status = "running"   // a worker is processing it right now
 	StatusSucceeded Status = "succeeded" // finished successfully

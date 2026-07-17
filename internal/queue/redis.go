@@ -24,7 +24,8 @@ const blockTimeout = 5 * time.Second
 // be reclaimed — giving us at-least-once delivery for free.
 type RedisQueue struct {
 	client   *redis.Client
-	stream   string // the Redis Stream key that holds jobs
+	stream   string // the Redis Stream key that holds jobs ready to run now
+	delayed  string // sorted set of scheduled jobs, scored by their run-at time
 	group    string // consumer group name (shared by all workers)
 	consumer string // this instance's name within the group
 }
@@ -45,7 +46,15 @@ func NewRedisQueue(addr, stream, group, consumer string) (*RedisQueue, error) {
 		return nil, fmt.Errorf("create consumer group: %w", err)
 	}
 
-	return &RedisQueue{client: client, stream: stream, group: group, consumer: consumer}, nil
+	// The delayed set lives beside the stream. Deriving its key (rather than
+	// taking another constructor arg) keeps the call site unchanged.
+	return &RedisQueue{
+		client:   client,
+		stream:   stream,
+		delayed:  stream + ":delayed",
+		group:    group,
+		consumer: consumer,
+	}, nil
 }
 
 // Enqueue serializes the job to JSON and appends it to the stream (XADD).
@@ -58,6 +67,50 @@ func (q *RedisQueue) Enqueue(ctx context.Context, j job.Job) error {
 		Stream: q.stream,
 		Values: map[string]any{"job": data},
 	}).Err()
+}
+
+// EnqueueAt schedules a job to become available at time `at` instead of right
+// now. It's stored in a sorted set (ZADD) scored by its run-at time in
+// milliseconds; PromoteDue later moves it into the live stream once that time
+// passes, after which it's delivered exactly like an immediately-enqueued job.
+// This is the "Scheduler" half of JobQ: delayed and future-dated work.
+func (q *RedisQueue) EnqueueAt(ctx context.Context, j job.Job, at time.Time) error {
+	data, err := json.Marshal(j)
+	if err != nil {
+		return fmt.Errorf("marshal job: %w", err)
+	}
+	return q.client.ZAdd(ctx, q.delayed, redis.Z{
+		Score:  float64(at.UnixMilli()),
+		Member: data,
+	}).Err()
+}
+
+// promoteScript atomically moves every job whose run-at has passed from the
+// delayed sorted set into the live stream. Running the whole find→append→remove
+// sequence as one Lua script makes it atomic within Redis's single execution
+// thread, so several JobQ instances can promote concurrently without ever
+// promoting a job twice: whichever instance's ZREM lands first wins, and the
+// member is gone for everyone else. KEYS: [delayed set, stream].
+// ARGV: [now-ms, batch limit].
+var promoteScript = redis.NewScript(`
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+for _, member in ipairs(due) do
+    redis.call('XADD', KEYS[2], '*', 'job', member)
+    redis.call('ZREM', KEYS[1], member)
+end
+return #due
+`)
+
+// PromoteDue moves up to `batch` now-due jobs from the delayed set into the
+// stream and returns how many it promoted. Callers run it on a ticker; a return
+// of 0 just means nothing is due yet.
+func (q *RedisQueue) PromoteDue(ctx context.Context, batch int) (int, error) {
+	now := time.Now().UnixMilli()
+	n, err := promoteScript.Run(ctx, q.client, []string{q.delayed, q.stream}, now, batch).Int()
+	if err != nil {
+		return 0, fmt.Errorf("promote due jobs: %w", err)
+	}
+	return n, nil
 }
 
 // Dequeue reads the next undelivered job for this group (XREADGROUP with ">"),

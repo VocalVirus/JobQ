@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/VocalVirus/jobq/internal/job"
 	"github.com/VocalVirus/jobq/internal/store"
@@ -15,8 +16,11 @@ import (
 
 // Server holds the dependencies the HTTP handlers need.
 type Server struct {
-	store  store.Store         // where job records live (for status lookups)
-	submit func(job.Job) error // how to hand a job to the durable queue; may fail
+	store store.Store // where job records live (for status lookups)
+	// submit hands a job to the durable queue, optionally delayed: a zero delay
+	// runs it as soon as possible, a positive delay schedules it for later. May
+	// fail (e.g. the queue is unreachable).
+	submit func(j job.Job, delay time.Duration) error
 }
 
 // NewServer wires up the routes and returns an http.Handler ready to serve.
@@ -25,7 +29,7 @@ type Server struct {
 // works with either the in-memory or the Postgres store. It uses Go 1.22+
 // routing patterns ("METHOD /path/{wildcard}"), so the method and path are
 // matched for us — no manual `if r.Method == ...` checks.
-func NewServer(st store.Store, submit func(job.Job) error) http.Handler {
+func NewServer(st store.Store, submit func(j job.Job, delay time.Duration) error) http.Handler {
 	s := &Server{store: st, submit: submit}
 
 	mux := http.NewServeMux()
@@ -35,9 +39,12 @@ func NewServer(st store.Store, submit func(job.Job) error) http.Handler {
 	return mux
 }
 
-// createRequest is the JSON body expected by POST /jobs.
+// createRequest is the JSON body expected by POST /jobs. DelaySeconds is
+// optional: omit it (or 0) to run the job as soon as possible, or set it to
+// schedule the job that many seconds into the future.
 type createRequest struct {
-	Payload string `json:"payload"`
+	Payload      string `json:"payload"`
+	DelaySeconds int    `json:"delay_seconds"`
 }
 
 // handleCreate accepts a new job, stores it, and queues it for processing.
@@ -60,16 +67,26 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "could not record job, try again")
 		return
 	}
+	// A positive delay means "run later": reflect that as a "scheduled" status so
+	// a lookup before the run-at time reads sensibly. A worker will overwrite it
+	// with "running" once the job is promoted and picked up.
+	delay := time.Duration(req.DelaySeconds) * time.Second
+	status := job.StatusQueued
+	if delay > 0 {
+		status = job.StatusScheduled
+		s.store.SetStatus(j.ID, status, 0)
+	}
+
 	// If the queue is unreachable (e.g. Redis down) we must NOT report success —
 	// tell the caller to retry with a 503 rather than silently dropping the job.
-	if err := s.submit(j); err != nil {
+	if err := s.submit(j, delay); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "could not enqueue job, try again")
 		return
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"id":     j.ID,
-		"status": job.StatusQueued,
+		"status": status,
 	})
 }
 
