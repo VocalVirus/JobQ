@@ -17,6 +17,23 @@ import (
 	"github.com/VocalVirus/jobq/internal/queue"
 )
 
+// Metrics receives observations from the pool as jobs run. It's the seam for
+// instrumentation: the pool reports numbers through this interface without
+// importing Prometheus (or anything else) — exactly like OnStatus reports state
+// changes without importing the store. A metrics.Recorder satisfies it, but so
+// could a test spy or a no-op. Optional: a nil Metrics means "don't measure".
+//
+// WorkerBusy/WorkerIdle bracket each handler call so a gauge can track how many
+// are running; JobFinished fires once per job at its terminal state; JobRetried
+// fires on each failed-but-retrying attempt. handlerDur is how long that single
+// handler invocation took (the retry backoff wait is deliberately excluded).
+type Metrics interface {
+	WorkerBusy()
+	WorkerIdle()
+	JobFinished(result string, handlerDur time.Duration) // result: "succeeded" | "dead"
+	JobRetried(handlerDur time.Duration)
+}
+
 // Config holds the tunable settings for a Pool. Using a struct (instead of a
 // long list of function arguments) keeps things readable as options grow.
 type Config struct {
@@ -38,6 +55,11 @@ type Config struct {
 	// world (e.g. a status store) without the pool needing to know what that store
 	// is. Optional: leave it nil and the pool simply won't report.
 	OnStatus func(id int, status job.Status, attempts int)
+
+	// Metrics, if set, receives observations (durations, outcomes, active count)
+	// as jobs run. Optional (nil = no measurement), same decoupling as OnStatus:
+	// the pool never imports the metrics package.
+	Metrics Metrics
 }
 
 // Pool manages a group of worker goroutines that share one durable job queue.
@@ -138,10 +160,14 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) bool {
 		j.Attempts++
 		p.setStatus(j.ID, job.StatusRunning, j.Attempts)
 
-		err := p.cfg.Handler(j)
+		// Time only the handler call (not the backoff wait) and bracket it with
+		// the busy/idle hooks so a gauge can count in-flight handlers accurately.
+		err, dur := p.runHandler(j)
+
 		if err == nil {
 			log.Printf("worker %d: job %d SUCCEEDED on attempt %d", workerID, j.ID, j.Attempts)
 			p.setStatus(j.ID, job.StatusSucceeded, j.Attempts)
+			p.jobFinished(job.StatusSucceeded, dur)
 			return true
 		}
 
@@ -151,11 +177,13 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) bool {
 				workerID, j.ID, j.Attempts, err)
 			p.setStatus(j.ID, job.StatusDead, j.Attempts)
 			p.toDeadLetter(j)
+			p.jobFinished(job.StatusDead, dur)
 			return true
 		}
 
 		// A transient failure: mark it failed (a retry is pending).
 		p.setStatus(j.ID, job.StatusFailed, j.Attempts)
+		p.jobRetried(dur)
 
 		// Otherwise wait (exponential backoff) and try again — but make the wait
 		// interruptible. `select` blocks until one of its cases can proceed:
@@ -183,6 +211,35 @@ func (p *Pool) process(ctx context.Context, workerID int, j job.Job) bool {
 func (p *Pool) setStatus(id int, s job.Status, attempts int) {
 	if p.cfg.OnStatus != nil {
 		p.cfg.OnStatus(id, s, attempts)
+	}
+}
+
+// runHandler executes one job's handler, timing just that call and reporting the
+// worker as busy for its duration. Returns the handler's error and how long it
+// ran. The busy/idle hooks are balanced via defer so the active gauge stays
+// correct even if the handler panics.
+func (p *Pool) runHandler(j job.Job) (error, time.Duration) {
+	if p.cfg.Metrics != nil {
+		p.cfg.Metrics.WorkerBusy()
+		defer p.cfg.Metrics.WorkerIdle()
+	}
+	start := time.Now()
+	err := p.cfg.Handler(j)
+	return err, time.Since(start)
+}
+
+// jobFinished / jobRetried forward terminal and retry observations to the
+// Metrics hook, if one is set. Nil-safe, mirroring setStatus, so an unmetered
+// pool (e.g. in tests) just skips them.
+func (p *Pool) jobFinished(result job.Status, dur time.Duration) {
+	if p.cfg.Metrics != nil {
+		p.cfg.Metrics.JobFinished(string(result), dur)
+	}
+}
+
+func (p *Pool) jobRetried(dur time.Duration) {
+	if p.cfg.Metrics != nil {
+		p.cfg.Metrics.JobRetried(dur)
 	}
 }
 

@@ -148,6 +148,38 @@ func (q *RedisQueue) Ack(ctx context.Context, m Message) error {
 	return q.client.XAck(ctx, q.stream, q.group, m.id).Err()
 }
 
+// Depth reports how many jobs sit in each of the queue's three holding areas,
+// for the metrics layer to expose as a gauge:
+//
+//   - ready:   entries in the stream (XLEN) — enqueued and waiting for a worker.
+//   - pending: delivered-but-unacked entries for the group (XPENDING) — a worker
+//     is holding them right now (or crashed mid-job and they await reclaim).
+//   - delayed: members of the sorted set (ZCARD) — scheduled for a future time.
+//
+// It's a point-in-time read, called on demand at scrape time rather than on a
+// timer, so the numbers are exactly as fresh as the scrape. Note `ready` counts
+// all stream entries including still-pending ones — that's Redis stream
+// semantics (XACK removes an entry), so treat the three as overlapping views,
+// not a partition that must sum to a total.
+func (q *RedisQueue) Depth(ctx context.Context) (ready, pending, delayed int64, err error) {
+	ready, err = q.client.XLen(ctx, q.stream).Result()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("stream length: %w", err)
+	}
+
+	p, err := q.client.XPending(ctx, q.stream, q.group).Result()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("pending count: %w", err)
+	}
+	pending = p.Count
+
+	delayed, err = q.client.ZCard(ctx, q.delayed).Result()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("delayed count: %w", err)
+	}
+	return ready, pending, delayed, nil
+}
+
 // Close releases the Redis connection.
 func (q *RedisQueue) Close() error {
 	return q.client.Close()

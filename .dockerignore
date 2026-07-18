@@ -1,0 +1,13 @@
+# Keep the Docker build context small and reproducible: the build only needs
+# Go sources + go.mod/go.sum. Everything here is either irrelevant to the build
+# or host-specific.
+.git
+.gitignore
+.claude
+Dockerfile
+.dockerignore
+docker-compose.yml
+prometheus.yml
+STUDY.md
+README.md
+*.md

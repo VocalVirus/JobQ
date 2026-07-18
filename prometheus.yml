@@ -1,0 +1,11 @@
+# Prometheus scrape config for the JobQ stack. Mounted into the prometheus
+# container by docker-compose.yml.
+global:
+  scrape_interval: 5s # how often to pull /metrics; fine for a local demo
+
+scrape_configs:
+  - job_name: jobq
+    # "jobq" resolves to the app container over the compose network; it serves
+    # metrics on 8080/metrics (the default metrics_path).
+    static_configs:
+      - targets: ["jobq:8080"]

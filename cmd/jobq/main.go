@@ -11,6 +11,11 @@
 // first with `docker compose up -d`. Shuts down gracefully on Ctrl+C:
 // stops accepting HTTP requests, then lets in-flight jobs finish (the rest stay
 // safely queued in Redis).
+//
+// Phase 7: the service is instrumented for Prometheus and exposes its metrics at
+// GET /metrics (job durations, outcomes, retries, active workers, and live queue
+// depth). `docker compose up` now runs the whole stack — Redis, Postgres, JobQ,
+// and Prometheus — together.
 package main
 
 import (
@@ -26,6 +31,7 @@ import (
 
 	"github.com/VocalVirus/jobq/internal/api"
 	"github.com/VocalVirus/jobq/internal/job"
+	"github.com/VocalVirus/jobq/internal/metrics"
 	"github.com/VocalVirus/jobq/internal/queue"
 	"github.com/VocalVirus/jobq/internal/store"
 	"github.com/VocalVirus/jobq/internal/worker"
@@ -68,6 +74,12 @@ func main() {
 	}
 	defer q.Close()
 
+	// Prometheus metrics. The recorder captures per-job events (durations,
+	// outcomes, active workers); RegisterQueueDepth adds a gauge that reads the
+	// queue's depth from Redis at scrape time. Exposed at /metrics below.
+	m := metrics.New()
+	m.RegisterQueueDepth(q)
+
 	pool := worker.NewPool(worker.Config{
 		NumWorkers:  3,
 		MaxAttempts: 4,
@@ -76,6 +88,7 @@ func main() {
 		Handler:     handler,
 		Queue:       q,            // workers pull from (and ack to) Redis
 		OnStatus:    st.SetStatus, // wire pool status updates into the store
+		Metrics:     m,            // observe job durations, outcomes, active count
 	})
 	pool.Start(ctx)
 
@@ -116,9 +129,16 @@ func main() {
 		}
 		return q.Enqueue(ctx, j)
 	}
+	// Parent mux: mount /metrics for Prometheus alongside the API. Keeping this
+	// here (rather than inside api.NewServer) means the api package stays free of
+	// any Prometheus dependency — the more specific "/metrics" pattern wins over
+	// the "/" catch-all that forwards everything else to the API handler.
+	root := http.NewServeMux()
+	root.Handle("/metrics", metrics.Handler())
+	root.Handle("/", api.NewServer(st, submit))
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: api.NewServer(st, submit),
+		Handler: root,
 	}
 
 	// Run the server in a goroutine so main can wait for the shutdown signal.
